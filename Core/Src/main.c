@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
+#include "rtc.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -32,6 +33,9 @@
 #include <string.h>
 
 #include "ssd1306.h"
+#include "df2301q_voice_recognition.h"
+#include "rtc_conf.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,7 +50,7 @@
 
 #define LIN_UART_HANDLE_PTR &huart1
 #define LIN_UART_INSTANCE USART1
-#define LIN_SEND_PERIOD 100
+#define LIN_SEND_PERIOD 250
 #define TX_BUFFER_SIZE 17 //11
 #define RX_BUFFER_SIZE 17 //12
 
@@ -57,7 +61,9 @@
 #define VOLTAGE_SCALING 10.0f
 #define SPEED_SCALING 26.2f // rpm
 
-#define BATTERY_VOLTAGE_PROTECTION 11.5f   // V
+#define BATTERY_VOLTAGE_PROTECTION 11.1f   // V
+
+#define VOICE_CHECK_PERIOD 500
 
 /* USER CODE END PD */
 
@@ -75,10 +81,11 @@ uint8_t txData[TX_BUFFER_SIZE];
 uint8_t rxData[RX_BUFFER_SIZE];
 uint8_t rxDataShadow[RX_BUFFER_SIZE];
 uint32_t LinSendSoftTimer;
+uint32_t VoiceRecognitionSoftTimer;
 
 volatile uint8_t lin_data_received_flag = 0;
 
-uint8_t uart_line[64];
+uint8_t uart_line[128];
 uint8_t lcd_line[32];
 
 float drive_voltage;
@@ -86,6 +93,12 @@ float drive_current;
 
 uint8_t low_voltage_flag = 0;
 uint8_t ref_speed = 0;
+
+uint8_t voice_cmd_id;
+
+// Timestamp
+extern RTC_TimeTypeDef timeNow;
+extern RTC_DateTypeDef dateNow;
 
 /* USER CODE END PV */
 
@@ -138,6 +151,8 @@ int main(void)
 	MX_USART1_UART_Init();
 	MX_TIM2_Init();
 	MX_I2C3_Init();
+	MX_I2C1_Init();
+	MX_RTC_Init();
 	/* USER CODE BEGIN 2 */
 
 	ssd1306_Init();
@@ -146,12 +161,16 @@ int main(void)
 	ssd1306_WriteString("ufnalski.edu.pl", Font_6x8, White);
 	ssd1306_SetCursor(28, 12);
 	ssd1306_WriteString("LIN bus demo", Font_6x8, White);
-	ssd1306_SetCursor(2, 24);
+	ssd1306_SetCursor(2, 22);
 	ssd1306_WriteString("BMW G08 heater blower", Font_6x8, White);
+	ssd1306_SetCursor(8, 32);
+	ssd1306_WriteString("with voice commands", Font_6x8, White);
 	ssd1306_UpdateScreen();
 
 	HAL_TIM_Encoder_Start_IT(&htim2, TIM_CHANNEL_ALL);
 	__HAL_TIM_SET_COUNTER(&htim2, (ENC_KNOB_CNT_MIN + ENC_KNOB_CNT_MAX) / 2);
+
+	SetRtcCompilationTimeAndDate();
 
 	/* USER CODE END 2 */
 
@@ -175,54 +194,13 @@ int main(void)
 
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
+	VoiceRecognitionSoftTimer = HAL_GetTick();
+	LinSendSoftTimer = HAL_GetTick();
+
 	while (1)
 	{
-		if (lin_data_received_flag == 1)
-		{
-			lin_data_received_flag = 0;
 
-			drive_voltage = ((float) (rxDataShadow[8])) / VOLTAGE_SCALING;
-
-			if (rxDataShadow[5] != 0xFE)
-			{
-				drive_current = ((float) (rxDataShadow[5])) / CURRENT_SCALING;
-			}
-			else
-			{
-				drive_current = 0;
-			}
-
-			sprintf((char*) uart_line,
-					"I = %.1f A,  U = %.1f V, Speed = %.0f rpm\r\n",
-					drive_current, drive_voltage,
-					((float) (rxDataShadow[6])) * SPEED_SCALING);
-			printf((char*) uart_line);
-
-			ssd1306_SetCursor(2, 42);
-			if (low_voltage_flag == 0)
-			{
-				sprintf((char*) lcd_line, "Ref. speed: %.0f rpm   ",
-						((float) ref_speed) * SPEED_SCALING);
-			}
-			else
-			{
-				sprintf((char*) lcd_line, "Ref. speed: %.0f (UVP)  ",
-						((float) ref_speed) * SPEED_SCALING);
-			}
-			ssd1306_WriteString((char*) lcd_line, Font_6x8, White);
-
-			ssd1306_SetCursor(2, 54);
-			sprintf((char*) lcd_line, "I: %.1f A,  U: %.1f V   ", drive_current,
-					drive_voltage);
-			ssd1306_WriteString((char*) lcd_line, Font_6x8, White);
-			ssd1306_UpdateScreen();
-
-			if (drive_voltage < BATTERY_VOLTAGE_PROTECTION)
-			{
-				low_voltage_flag = 1;
-			}
-		}
-
+		// Reference speed sending
 		if (HAL_GetTick() - LinSendSoftTimer > LIN_SEND_PERIOD)
 		{
 			LinSendSoftTimer = HAL_GetTick();
@@ -265,6 +243,89 @@ int main(void)
 			HAL_LIN_SendBreak(LIN_UART_HANDLE_PTR);
 			HAL_UART_Transmit(LIN_UART_HANDLE_PTR, txData, 2, LIN_SEND_PERIOD);
 		}
+
+		// Diagnostic data reading
+		if (lin_data_received_flag == 1)
+		{
+			lin_data_received_flag = 0;
+
+			drive_voltage = ((float) (rxDataShadow[8])) / VOLTAGE_SCALING;
+
+			if (rxDataShadow[5] != 0xFE)
+			{
+				drive_current = ((float) (rxDataShadow[5])) / CURRENT_SCALING;
+			}
+			else
+			{
+				drive_current = 0;
+			}
+
+			HAL_RTC_GetTime(&hrtc, &timeNow, RTC_FORMAT_BIN);
+			HAL_RTC_GetDate(&hrtc, &dateNow, RTC_FORMAT_BIN);
+			// https://msalamon.pl/a-jak-to-jest-z-tym-rtc-na-stm32f4/
+			float timeNow_Milliseconds = (timeNow.SecondFraction
+					- timeNow.SubSeconds) / ((float) timeNow.SecondFraction + 1)
+					* 1000;
+			sprintf((char*) uart_line,
+					"[%02d:%02d:%02d:%03.0f] I = %2.1f A,  U = %3.1f V, w = %4.0f rpm (w_ref = %4.0f rpm)\r\n",
+					timeNow.Hours, timeNow.Minutes, timeNow.Seconds,
+					timeNow_Milliseconds, drive_current, drive_voltage,
+					((float) (rxDataShadow[6])) * SPEED_SCALING,
+					((float) ref_speed) * SPEED_SCALING);
+			printf((char*) uart_line);
+
+			ssd1306_SetCursor(2, 46);
+			if (low_voltage_flag == 0)
+			{
+				sprintf((char*) lcd_line, "Speed: %.0f/%.0f rpm   ",
+						((float) (rxDataShadow[6])) * SPEED_SCALING,
+						((float) ref_speed) * SPEED_SCALING);
+			}
+			else
+			{
+				sprintf((char*) lcd_line, "Ref. speed: %.0f (UVP)  ",
+						((float) ref_speed) * SPEED_SCALING);
+			}
+			ssd1306_WriteString((char*) lcd_line, Font_6x8, White);
+
+			ssd1306_SetCursor(2, 56);
+			sprintf((char*) lcd_line, "I: %.1f A,  U: %.1f V   ", drive_current,
+					drive_voltage);
+			ssd1306_WriteString((char*) lcd_line, Font_6x8, White);
+			ssd1306_UpdateScreen();
+
+			if (drive_voltage < BATTERY_VOLTAGE_PROTECTION)
+			{
+				low_voltage_flag = 1;
+			}
+		}
+
+		// Voice recognition module
+		if (HAL_GetTick() - VoiceRecognitionSoftTimer > VOICE_CHECK_PERIOD)
+		{
+			VoiceRecognitionSoftTimer = HAL_GetTick();
+			voice_cmd_id = DF2301G_GetCommandID();
+			switch (voice_cmd_id)
+			{
+			case VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_ONE:
+				__HAL_TIM_SET_COUNTER(&htim2, ENC_KNOB_CNT_MAX / 3);
+				printf("Voice command: %s\r\n",
+				VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_ONE_STRING);
+				break;
+			case VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_TWO:
+				__HAL_TIM_SET_COUNTER(&htim2, ENC_KNOB_CNT_MAX / 3 * 2);
+				printf("Voice command: %s\r\n",
+				VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_TWO_STRING);
+				break;
+			case VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_THREE:
+				__HAL_TIM_SET_COUNTER(&htim2, ENC_KNOB_CNT_MAX);
+				printf("Voice command: %s\r\n",
+				VOICE_CMD_TURN_FAN_SPEED_TO_GEAR_THREE_STRING);
+				break;
+			default:
+				__NOP();
+			}
+		}
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
@@ -290,9 +351,11 @@ void SystemClock_Config(void)
 	/** Initializes the RCC Oscillators according to the specified parameters
 	 * in the RCC_OscInitTypeDef structure.
 	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI
+			| RCC_OSCILLATORTYPE_LSI;
 	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
 	RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+	RCC_OscInitStruct.LSIState = RCC_LSI_ON;
 	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
 	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
 	RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
